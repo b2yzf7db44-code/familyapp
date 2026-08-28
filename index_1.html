@@ -1,0 +1,2619 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>FamilyApp</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+
+<!-- Firebase (compat build: exposes a global `firebase`, so no build step needed) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script>
+  // NOTE: this apiKey is NOT a secret — Firebase web keys are meant to be public.
+  // What actually protects your data is the Firestore Security Rules.
+  firebase.initializeApp({
+    apiKey: "AIzaSyCA-t12NmliSWor_8qlA9Rl1D4TihUdzPI",
+    authDomain: "w-familyapp.firebaseapp.com",
+    projectId: "w-familyapp",
+    storageBucket: "w-familyapp.firebasestorage.app",
+    messagingSenderId: "1040102793726",
+    appId: "1:1040102793726:web:d991b60514b5945772a0af"
+  });
+</script>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    min-height: 100vh;
+    min-height: 100dvh;
+    background: #F3EDDD;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding: 24px 12px 48px;
+    font-family: 'Noto Sans TC', 'PingFang HK', 'Microsoft JhengHei', sans-serif;
+  }
+  #root { width: 100%; display: flex; justify-content: center; }
+
+  /* Phones: go edge-to-edge instead of floating a narrow card in the middle */
+  @media (max-width: 520px) {
+    body {
+      padding: 0;
+      padding-top: env(safe-area-inset-top);
+      padding-left: env(safe-area-inset-left);
+      padding-right: env(safe-area-inset-right);
+      padding-bottom: env(safe-area-inset-bottom);
+      background: #FBF7EE;
+    }
+    #root .fh-app {
+      max-width: 100%;
+      border-radius: 0;
+      box-shadow: none;
+      min-height: 100vh;
+      min-height: 100dvh;
+    }
+  }
+
+  /* iOS zooms the page in when you focus an input smaller than 16px.
+     Bump inputs to 16px on touch screens to stop that. */
+  @media (max-width: 520px) {
+    input, select, textarea { font-size: 16px !important; }
+    /* Comfortable tap targets */
+    .fh-chip { min-height: 38px; display: inline-flex; align-items: center; }
+    .fh-chip-sm { min-height: 34px; }
+    .fh-check { width: 24px !important; height: 24px !important; }
+    .fh-tabs button { padding: 12px 8px !important; }
+  }
+
+  /* Long item or shop names shouldn't push the layout sideways */
+  .fh-item-name, .fh-pass-title, .fh-pass-sub { overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+  // If anything fails to load or parse, show a message instead of a blank page.
+  window.addEventListener("error", function (e) {
+    var root = document.getElementById("root");
+    if (root && !root.hasChildNodes()) {
+      root.innerHTML =
+        '<div style="max-width:430px;background:#fff;border:1px solid #E3D9C4;' +
+        'border-radius:12px;padding:20px;font-size:14px;color:#2B2420;line-height:1.6">' +
+        '<b>個App載入唔到</b><br>' +
+        '錯誤：<code style="font-size:12px;color:#A83232">' +
+        String(e.message || e.error || "unknown").replace(/</g, "&lt;") +
+        '</code><br><br>' +
+        '如果係網絡問題，check下有冇上網（React 由 CDN 載入，第一次開需要網絡）。' +
+        '</div>';
+    }
+  });
+</script>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ---------- Storage: Firebase Firestore (shared across the whole family) ----------
+// One document holds the whole board, so every phone reads/writes the same thing.
+// Change FAMILY_ID if you ever want a second, separate board.
+const FAMILY_ID = "home";
+
+const db = firebase.firestore();
+const boardRef = db.collection("families").doc(FAMILY_ID);
+
+// Keep working (read-only-ish) if the phone briefly loses signal.
+db.enablePersistence({ synchronizeTabs: true }).catch(function () {
+  /* multiple tabs open, or unsupported browser - not fatal */
+});
+
+const storage = {
+  async get(key) {
+    const snap = await boardRef.get();
+    if (!snap.exists) return null;
+    const d = snap.data();
+    if (!d || d.value == null) return null;
+    return { key, value: d.value, shared: true };
+  },
+  async set(key, value) {
+    await boardRef.set(
+      { value: value, updatedAt: firebase.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+    return { key, value, shared: true };
+  },
+  async delete(key) {
+    await boardRef.delete();
+    return { key, deleted: true, shared: true };
+  },
+  // Live updates: fires whenever anyone in the family changes the board.
+  subscribe(onChange, onError) {
+    return boardRef.onSnapshot(
+      function (snap) {
+        if (!snap.exists) {
+          onChange(null);
+          return;
+        }
+        const d = snap.data();
+        onChange(d && d.value != null ? d.value : null);
+      },
+      function (err) {
+        if (onError) onError(err);
+      }
+    );
+  },
+};
+
+// ---------- Minimal icon set (replaces lucide-react so this file has zero build step) ----------
+function Icon({ children, size = 16, color = "currentColor", strokeWidth = 2, className = "" }) {
+  return (
+    <svg
+      width={size} height={size} viewBox="0 0 24 24"
+      fill="none" stroke={color} strokeWidth={strokeWidth}
+      strokeLinecap="round" strokeLinejoin="round"
+      className={className}
+    >
+      {children}
+    </svg>
+  );
+}
+const Plus = (p) => <Icon {...p}><path d="M12 5v14M5 12h14" /></Icon>;
+const X = (p) => <Icon {...p}><path d="M18 6 6 18M6 6l12 12" /></Icon>;
+const Check = (p) => <Icon {...p}><polyline points="20 6 9 17 4 12" /></Icon>;
+const Trash2 = (p) => (
+  <Icon {...p}>
+    <path d="M3 6h18" />
+    <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+    <line x1="10" y1="11" x2="10" y2="17" />
+    <line x1="14" y1="11" x2="14" y2="17" />
+  </Icon>
+);
+const ChevronDown = (p) => <Icon {...p}><polyline points="6 9 12 15 18 9" /></Icon>;
+const ChevronUp = (p) => <Icon {...p}><polyline points="18 15 12 9 6 15" /></Icon>;
+const Plane = (p) => <Icon {...p}><path d="M22 2 11 13" /><path d="M22 2 15 22 11 13 2 9 22 2Z" /></Icon>;
+const ShoppingBag = (p) => (
+  <Icon {...p}>
+    <path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z" />
+    <path d="M3 6h18" />
+    <path d="M16 10a4 4 0 0 1-8 0" />
+  </Icon>
+);
+const ShoppingCart = (p) => (
+  <Icon {...p}>
+    <circle cx="8" cy="21" r="1" />
+    <circle cx="19" cy="21" r="1" />
+    <path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12" />
+  </Icon>
+);
+const RefreshCw = (p) => (
+  <Icon {...p}>
+    <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8" />
+    <path d="M21 3v5h-5" />
+  </Icon>
+);
+const MapPin = (p) => (
+  <Icon {...p}>
+    <path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z" />
+    <circle cx="12" cy="10" r="3" />
+  </Icon>
+);
+const Calendar = (p) => (
+  <Icon {...p}>
+    <rect x="3" y="4" width="18" height="18" rx="2" />
+    <line x1="16" y1="2" x2="16" y2="6" />
+    <line x1="8" y1="2" x2="8" y2="6" />
+    <line x1="3" y1="10" x2="21" y2="10" />
+  </Icon>
+);
+const Tag = (p) => (
+  <Icon {...p}>
+    <path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z" />
+    <circle cx="7.5" cy="7.5" r="1.5" />
+  </Icon>
+);
+const ArrowLeft = (p) => (
+  <Icon {...p}>
+    <path d="M19 12H5" />
+    <path d="m12 19-7-7 7-7" />
+  </Icon>
+);
+const Camera = (p) => (
+  <Icon {...p}>
+    <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3Z" />
+    <circle cx="12" cy="13" r="3.5" />
+  </Icon>
+);
+const Pencil = (p) => (
+  <Icon {...p}>
+    <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+    <path d="M15 5l4 4" />
+  </Icon>
+);
+
+const STORAGE_KEY = "family-app:board";
+const uid = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+const OUTLETS = [
+  { key: "Tesco", emoji: "🛒" },
+  { key: "Sainsbury's", emoji: "🧡" },
+  { key: "M&S", emoji: "🎀" },
+  { key: "Costco", emoji: "📦" },
+  { key: "永興隆", emoji: "🏮" },
+  { key: "B&M", emoji: "🧺" },
+];
+
+const CATEGORY_META = {
+  蔬菜: "🥬", 生果: "🍎", 肉類: "🥩", 海鮮: "🦐", 蛋奶: "🥚", 醬料: "🧂",
+  麵包: "🍞", 罐頭: "🥫", 飲品: "🥤", 急凍: "🧊", 零食: "🍪", 雜貨: "🌾",
+  麵食: "🍜", 日用品: "🧻", 清潔用品: "🧽", 藥物: "💊",
+};
+const CATEGORY_LIST = Object.keys(CATEGORY_META);
+
+const PRESET_ITEMS = {
+  蔬菜: ["椰菜花", "甘筍", "生菜", "粟米", "羽衣甘藍", "菠菜", "西芹", "西蘭花", "Green Beans", "薑", "蒜頭", "蔥", "矮瓜", "蕃茄", "薯仔", "洋蔥", "牛油果", "燈籠椒", "辣椒"],
+  生果: ["香蕉", "士多啤梨", "藍莓", "紅莓", "黑莓", "蘋果", "橙 / 柑", "提子"],
+  肉類: ["Pork Shoulder", "豬扒", "排骨", "牛扒", "Beef Skirt", "雞胸", "雞上髀", "鴨"],
+  海鮮: ["鯖魚", "三文魚", "Cod Loin", "煙三文魚", "蝦"],
+  蛋奶: ["雞蛋", "牛奶", "乳酪", "豆腐", "片裝芝士", "芝士碎", "無糖豆漿", "有鹽牛油", "無鹽牛油"],
+  醬料: ["牛油果油", "豉油", "老抽", "花生醬", "蠔油", "蒜頭豆豉醬", "意粉醬", "餃子汁", "鰹魚湯汁", "昆布醬油", "飯素", "味噌", "BB醬"],
+  麵包: ["Sourdough", "普通麵包", "Pancakes", "蒜蓉包"],
+  罐頭: ["粟米", "吞拿魚", "鯖魚", "罐頭湯"],
+  飲品: ["果汁", "有汽礦泉水", "茶", "Concentrated coffee"],
+  急凍: ["餃子", "餃子皮", "Fish Fingers", "燒賣", "納豆", "冰烏冬", "蝦", "丸"],
+  零食: ["薯片", "雪糕", "Pocky", "梳打餅", "威化餅"],
+  雜貨: ["響鈴", "鷹粟粉", "麵粉", "茶包"],
+  麵食: ["意粉", "通粉", "粉絲", "花瓣麵", "粗麵", "幼麵", "蕎麥麵", "白身麵", "蝦子麵", "公仔麵"],
+  日用品: ["衛生巾", "護墊", "梘液", "洗頭水", "護髮素", "卷廁紙", "盒裝廁紙", "廚房紙", "牙膏 (M&W)", "牙刷 (M&W)", "牙膏 (T)", "牙刷 (T)", "漱口水"],
+  清潔用品: ["洗潔精", "滴露", "洗衣液", "洗衣香味珠", "柔順劑", "漂白水"],
+  藥物: ["Panadol (大人)", "Calpol (T)", "Calprofen (T)"],
+};
+
+const fmtDate = (d) => d.toISOString().slice(0, 10);
+const todayStr = fmtDate(new Date());
+const tomorrowDate = new Date();
+tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+const tomorrowStr = fmtDate(tomorrowDate);
+const satDate = new Date();
+satDate.setDate(satDate.getDate() + (((6 - satDate.getDay()) % 7) || 7));
+const satStr = fmtDate(satDate);
+
+const displayDate = (str) => {
+  if (!str) return "";
+  const d = new Date(str + "T00:00:00");
+  if (Number.isNaN(d.getTime())) return str;
+  return d.toLocaleDateString("zh-HK", { month: "numeric", day: "numeric", weekday: "short" });
+};
+
+const DEFAULT_PACKING_TEMPLATE = [
+  "護照", "身份證", "機票 / 登機證", "旅遊保險", "錢包 / 現金", "信用卡",
+  "電話", "充電器", "尿袋", "轉插頭", "耳機",
+  "衫", "褲", "內衣", "襪", "睡衣", "外套", "鞋",
+  "牙刷牙膏", "洗面奶", "護膚品", "防曬", "梳",
+  "常用藥", "暈浪丸", "膠布", "口罩",
+  "雨傘", "水樽", "環保袋", "紙巾",
+];
+
+function loadFallback() {
+  return {
+    shoppingLists: [],
+    trips: [],
+    packingTemplate: DEFAULT_PACKING_TEMPLATE.map((text) => ({ id: uid(), text })),
+  };
+}
+
+// Older saved data won't have the newer fields — fill them in so nothing crashes.
+function normalizeData(raw) {
+  const d = raw || {};
+  return {
+    shoppingLists: d.shoppingLists || [],
+    trips: (d.trips || []).map((t) => ({
+      ...t,
+      items: t.items || [],
+      packing: t.packing || [],
+      shopping: t.shopping || [],
+      days: t.days || [],
+    })),
+    packingTemplate:
+      d.packingTemplate ||
+      DEFAULT_PACKING_TEMPLATE.map((text) => ({ id: uid(), text })),
+  };
+}
+
+const emptyExtend = {
+  listId: null,
+  step: "category",
+  categories: [],
+  addingCategory: false,
+  newCategoryText: "",
+  itemsByCat: {},
+  customItemText: {},
+};
+
+const emptyWizard = {
+  step: 1,
+  date: todayStr,
+  outlet: "",
+  customOutletMode: false,
+  customOutlet: "",
+  categories: [],
+  addingCategory: false,
+  newCategoryText: "",
+  itemsByCat: {},
+  customItemText: {},
+};
+
+function FamilyApp() {
+  const [tab, setTab] = useState("grocery");
+  const [data, setData] = useState(null);
+  const [syncing, setSyncing] = useState(true);
+  const [lastSynced, setLastSynced] = useState(null);
+  const [errorMsg, setErrorMsg] = useState("");
+
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const [w, setW] = useState(emptyWizard);
+  const [expandedListId, setExpandedListId] = useState(null);
+  const [confirmClearAll, setConfirmClearAll] = useState(false);
+  const [extraItemText, setExtraItemText] = useState({});
+  const [extend, setExtend] = useState(emptyExtend);
+
+  const [showNewTrip, setShowNewTrip] = useState(false);
+  const [newTripTitle, setNewTripTitle] = useState("");
+  const [newTripPlace, setNewTripPlace] = useState("");
+  const [newTripStart, setNewTripStart] = useState("");
+  const [newTripEnd, setNewTripEnd] = useState("");
+  const [openTripId, setOpenTripId] = useState(null);
+  const [editTripDraft, setEditTripDraft] = useState(null);
+  const [tripTab, setTripTab] = useState("itinerary");
+  const [dayDrafts, setDayDrafts] = useState({});
+  const [viewPhoto, setViewPhoto] = useState(null);
+  const [templateOpen, setTemplateOpen] = useState(false);
+  const [newTemplateText, setNewTemplateText] = useState("");
+  const [newPackText, setNewPackText] = useState({});
+  const [confirmResetPack, setConfirmResetPack] = useState(false);
+  const [newShopText, setNewShopText] = useState({});
+  const [newShopWhere, setNewShopWhere] = useState({});
+  const [newTaskText, setNewTaskText] = useState({});
+
+  const dataRef = useRef(data);
+  dataRef.current = data;
+
+  const fetchData = useCallback(async (isInitial) => {
+    try {
+      if (isInitial) setSyncing(true);
+      const res = await storage.get(STORAGE_KEY);
+      const parsed = res ? JSON.parse(res.value) : loadFallback();
+      setData(normalizeData(parsed));
+      setLastSynced(new Date());
+      setErrorMsg("");
+    } catch (e) {
+      if (isInitial) setData(loadFallback());
+      setErrorMsg("連接唔到資料庫：" + (e && e.message ? e.message : e));
+    } finally {
+      if (isInitial) setSyncing(false);
+    }
+  }, []);
+
+  const persist = useCallback(async (partial) => {
+    // Merge, so callers can pass only the slice they changed without
+    // accidentally wiping the others (e.g. packingTemplate).
+    const next = { ...(dataRef.current || loadFallback()), ...partial };
+    setData(next);
+    try {
+      await storage.set(STORAGE_KEY, JSON.stringify(next));
+      setLastSynced(new Date());
+      setErrorMsg("");
+    } catch (e) {
+      setErrorMsg("寫入失敗：" + (e && e.message ? e.message : e));
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSyncing(true);
+
+    // Live listener: any change made on any family member's phone lands here.
+    const unsubscribe = storage.subscribe(
+      function (rawValue) {
+        if (cancelled) return;
+        let parsed = loadFallback();
+        if (rawValue != null) {
+          try {
+            parsed = JSON.parse(rawValue);
+          } catch (e) {
+            parsed = loadFallback();
+          }
+        }
+        setData(normalizeData(parsed));
+        setLastSynced(new Date());
+        setErrorMsg("");
+        setSyncing(false);
+      },
+      function (err) {
+        if (cancelled) return;
+        setData(function (d) {
+          return d || loadFallback();
+        });
+        setErrorMsg("連接唔到資料庫：" + (err && err.message ? err.message : err));
+        setSyncing(false);
+      }
+    );
+
+    return function () {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
+  if (!data) {
+    return (
+      <div className="fh-app fh-loading">
+        <StyleBlock />
+        <div className="fh-loading-inner">
+          <div className="fh-spinner" />
+          <p>準備緊屋企嘅資料板…</p>
+        </div>
+      </div>
+    );
+  }
+
+  const { shoppingLists, trips, packingTemplate } = data;
+
+  // ---------- Wizard logic ----------
+  const startWizard = () => {
+    setW(emptyWizard);
+    setWizardOpen(true);
+  };
+  const quickStartOutlet = (outletKey) => {
+    setW({ ...emptyWizard, date: todayStr, outlet: outletKey, step: 3 });
+    setWizardOpen(true);
+  };
+  const quickStartRepeat = () => {
+    if (shoppingLists.length === 0) return;
+    const last = shoppingLists[0];
+    setW({
+      ...emptyWizard,
+      date: todayStr,
+      outlet: last.outlet,
+      categories: [...last.categories],
+      step: 4,
+    });
+    setWizardOpen(true);
+  };
+  const cancelWizard = () => {
+    setWizardOpen(false);
+    setW(emptyWizard);
+  };
+  const pickDate = (d) => setW((s) => ({ ...s, date: d }));
+  const pickOutlet = (key) =>
+    setW((s) => ({ ...s, outlet: key, customOutletMode: false }));
+  const pickCustomOutlet = () =>
+    setW((s) => ({ ...s, outlet: "", customOutletMode: true }));
+  const toggleCategory = (cat) =>
+    setW((s) => ({
+      ...s,
+      categories: s.categories.includes(cat)
+        ? s.categories.filter((c) => c !== cat)
+        : [...s.categories, cat],
+    }));
+  const confirmAddCategory = () => {
+    const name = w.newCategoryText.trim();
+    if (!name) return;
+    setW((s) => ({
+      ...s,
+      categories: s.categories.includes(name) ? s.categories : [...s.categories, name],
+      addingCategory: false,
+      newCategoryText: "",
+    }));
+  };
+  const toggleWizardItem = (cat, item) =>
+    setW((s) => {
+      const cur = s.itemsByCat[cat] || [];
+      const next = cur.includes(item) ? cur.filter((i) => i !== item) : [...cur, item];
+      return { ...s, itemsByCat: { ...s.itemsByCat, [cat]: next } };
+    });
+  const confirmAddWizardItem = (cat) => {
+    const text = (w.customItemText[cat] || "").trim();
+    if (!text) return;
+    setW((s) => {
+      const cur = s.itemsByCat[cat] || [];
+      return {
+        ...s,
+        itemsByCat: { ...s.itemsByCat, [cat]: cur.includes(text) ? cur : [...cur, text] },
+        customItemText: { ...s.customItemText, [cat]: "" },
+      };
+    });
+  };
+
+  const totalWizardItems = Object.values(w.itemsByCat).reduce(
+    (sum, arr) => sum + arr.length,
+    0
+  );
+  const finalOutlet = w.customOutletMode ? w.customOutlet.trim() : w.outlet;
+
+  const canGoNext =
+    (w.step === 1 && !!w.date) ||
+    (w.step === 2 && !!finalOutlet) ||
+    (w.step === 3 && w.categories.length > 0);
+
+  const nextStep = () => setW((s) => ({ ...s, step: Math.min(4, s.step + 1) }));
+  const prevStep = () => setW((s) => ({ ...s, step: Math.max(1, s.step - 1) }));
+
+  const finishWizard = () => {
+    const items = [];
+    w.categories.forEach((cat) => {
+      (w.itemsByCat[cat] || []).forEach((name) =>
+        items.push({ id: uid(), name, category: cat, done: false })
+      );
+    });
+    if (items.length === 0) return;
+    const newList = {
+      id: uid(),
+      date: w.date,
+      outlet: finalOutlet,
+      categories: [...w.categories],
+      items,
+    };
+    persist({ shoppingLists: [newList, ...shoppingLists], trips });
+    setWizardOpen(false);
+    setW(emptyWizard);
+    setExpandedListId(newList.id);
+  };
+
+  // ---------- Shopping list (post-creation) logic ----------
+  const toggleShopItem = (listId, itemId) => {
+    persist({
+      shoppingLists: shoppingLists.map((l) =>
+        l.id === listId
+          ? {
+              ...l,
+              items: l.items.map((it) =>
+                it.id === itemId ? { ...it, done: !it.done } : it
+              ),
+            }
+          : l
+      ),
+      trips,
+    });
+  };
+  const deleteShopItem = (listId, itemId) => {
+    persist({
+      shoppingLists: shoppingLists.map((l) =>
+        l.id === listId ? { ...l, items: l.items.filter((it) => it.id !== itemId) } : l
+      ),
+      trips,
+    });
+  };
+  const deleteShoppingList = (listId) => {
+    persist({ shoppingLists: shoppingLists.filter((l) => l.id !== listId), trips });
+  };
+  const clearAllShoppingLists = () => {
+    persist({ shoppingLists: [], trips });
+    setConfirmClearAll(false);
+    setExpandedListId(null);
+  };
+  const addPresetToList = (listId, cat, name) => {
+    persist({
+      shoppingLists: shoppingLists.map((l) =>
+        l.id === listId
+          ? { ...l, items: [...l.items, { id: uid(), name, category: cat, done: false }] }
+          : l
+      ),
+      trips,
+    });
+  };
+  const addCustomToList = (listId, cat) => {
+    const key = `${listId}:${cat}`;
+    const text = (extraItemText[key] || "").trim();
+    if (!text) return;
+    addPresetToList(listId, cat, text);
+    setExtraItemText((s) => ({ ...s, [key]: "" }));
+  };
+
+  // ---------- Extend an existing list with a new category (steps 3→4 again) ----------
+  const openExtend = (listId) => setExtend({ ...emptyExtend, listId });
+  const closeExtend = () => setExtend(emptyExtend);
+  const toggleExtendCategory = (cat) =>
+    setExtend((s) => ({
+      ...s,
+      categories: s.categories.includes(cat)
+        ? s.categories.filter((c) => c !== cat)
+        : [...s.categories, cat],
+    }));
+  const confirmAddExtendCategory = () => {
+    const name = extend.newCategoryText.trim();
+    if (!name) return;
+    setExtend((s) => ({
+      ...s,
+      categories: s.categories.includes(name) ? s.categories : [...s.categories, name],
+      addingCategory: false,
+      newCategoryText: "",
+    }));
+  };
+  const toggleExtendItem = (cat, item) =>
+    setExtend((s) => {
+      const cur = s.itemsByCat[cat] || [];
+      const next = cur.includes(item) ? cur.filter((i) => i !== item) : [...cur, item];
+      return { ...s, itemsByCat: { ...s.itemsByCat, [cat]: next } };
+    });
+  const confirmAddExtendItem = (cat) => {
+    const text = (extend.customItemText[cat] || "").trim();
+    if (!text) return;
+    setExtend((s) => {
+      const cur = s.itemsByCat[cat] || [];
+      return {
+        ...s,
+        itemsByCat: { ...s.itemsByCat, [cat]: cur.includes(text) ? cur : [...cur, text] },
+        customItemText: { ...s.customItemText, [cat]: "" },
+      };
+    });
+  };
+  const extendTotalItems = Object.values(extend.itemsByCat).reduce(
+    (sum, arr) => sum + arr.length,
+    0
+  );
+  const finishExtend = () => {
+    const newItems = [];
+    extend.categories.forEach((cat) => {
+      (extend.itemsByCat[cat] || []).forEach((name) =>
+        newItems.push({ id: uid(), name, category: cat, done: false })
+      );
+    });
+    if (newItems.length === 0) return;
+    persist({
+      shoppingLists: shoppingLists.map((l) =>
+        l.id === extend.listId
+          ? {
+              ...l,
+              categories: [
+                ...l.categories,
+                ...extend.categories.filter((c) => !l.categories.includes(c)),
+              ],
+              items: [...l.items, ...newItems],
+            }
+          : l
+      ),
+      trips,
+    });
+    closeExtend();
+  };
+
+  // ---------- Travel logic (unchanged) ----------
+  // ---------- Trips ----------
+  const addTrip = () => {
+    const title = newTripTitle.trim();
+    if (!title) return;
+    const trip = {
+      id: uid(),
+      title,
+      place: newTripPlace.trim(),
+      start: newTripStart,
+      end: newTripEnd,
+      items: [],
+      // Copy the template in. Ticking things off here never touches the template.
+      packing: (packingTemplate || []).map((t) => ({
+        id: uid(),
+        text: t.text,
+        done: false,
+      })),
+      shopping: [],
+      days: [],
+    };
+    persist({ trips: [trip, ...trips] });
+    setNewTripTitle("");
+    setNewTripPlace("");
+    setNewTripStart("");
+    setNewTripEnd("");
+    setShowNewTrip(false);
+    setOpenTripId(trip.id);
+    setTripTab("itinerary");
+  };
+  const deleteTrip = (id) => {
+    persist({ trips: trips.filter((t) => t.id !== id) });
+    setOpenTripId(null);
+    setEditTripDraft(null);
+  };
+
+  const updateTrip = (tripId, updater) => {
+    persist({ trips: trips.map((t) => (t.id === tripId ? updater(t) : t)) });
+  };
+
+  // ---------- Edit trip place / dates ----------
+  const startEditTrip = (t) =>
+    setEditTripDraft({ place: t.place || "", start: t.start || "", end: t.end || "" });
+  const cancelEditTrip = () => setEditTripDraft(null);
+  const saveEditTrip = (tripId) => {
+    if (!editTripDraft) return;
+    updateTrip(tripId, (t) => ({
+      ...t,
+      place: editTripDraft.place.trim(),
+      start: editTripDraft.start,
+      end: editTripDraft.end,
+    }));
+    setEditTripDraft(null);
+  };
+
+  // ---------- 行程：day-by-day itinerary ----------
+  const addDay = (tripId) =>
+    updateTrip(tripId, (t) => ({
+      ...t,
+      days: [
+        ...(t.days || []),
+        { id: uid(), morning: "", afternoon: "", evening: "", stay: "" },
+      ],
+    }));
+  const removeDay = (tripId, dayId) =>
+    updateTrip(tripId, (t) => ({
+      ...t,
+      days: (t.days || []).filter((d) => d.id !== dayId),
+    }));
+  const dayDraftKey = (tripId, dayId, field) => tripId + ":" + dayId + ":" + field;
+  const getDayFieldValue = (tripId, day, field) => {
+    const k = dayDraftKey(tripId, day.id, field);
+    return k in dayDrafts ? dayDrafts[k] : day[field] || "";
+  };
+  const onDayFieldChange = (tripId, dayId, field, value) => {
+    setDayDrafts((s) => ({ ...s, [dayDraftKey(tripId, dayId, field)]: value }));
+  };
+  const commitDayField = (tripId, dayId, field) => {
+    const k = dayDraftKey(tripId, dayId, field);
+    if (!(k in dayDrafts)) return;
+    const value = dayDrafts[k];
+    updateTrip(tripId, (t) => ({
+      ...t,
+      days: (t.days || []).map((d) => (d.id === dayId ? { ...d, [field]: value } : d)),
+    }));
+    setDayDrafts((s) => {
+      const next = { ...s };
+      delete next[k];
+      return next;
+    });
+  };
+
+  // ---------- 買嘢：photo attach (resized + compressed, stored inline) ----------
+  const attachShopPhoto = (tripId, itemId, file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const maxDim = 640;
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.6);
+        updateTrip(tripId, (t) => ({
+          ...t,
+          shopping: t.shopping.map((i) =>
+            i.id === itemId ? { ...i, photo: dataUrl } : i
+          ),
+        }));
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  };
+  const removeShopPhoto = (tripId, itemId) =>
+    updateTrip(tripId, (t) => ({
+      ...t,
+      shopping: t.shopping.map((i) => (i.id === itemId ? { ...i, photo: null } : i)),
+    }));
+
+  // ---------- 行程 to-dos ----------
+  const addTask = (tripId) => {
+    const text = (newTaskText[tripId] || "").trim();
+    if (!text) return;
+    updateTrip(tripId, (t) => ({
+      ...t,
+      items: [...t.items, { id: uid(), text, done: false }],
+    }));
+    setNewTaskText((s) => ({ ...s, [tripId]: "" }));
+  };
+  const toggleTask = (tripId, taskId) =>
+    updateTrip(tripId, (t) => ({
+      ...t,
+      items: t.items.map((it) => (it.id === taskId ? { ...it, done: !it.done } : it)),
+    }));
+  const deleteTask = (tripId, taskId) =>
+    updateTrip(tripId, (t) => ({
+      ...t,
+      items: t.items.filter((it) => it.id !== taskId),
+    }));
+
+  // ---------- 執嘢 (this trip's copy) ----------
+  const togglePack = (tripId, packId) =>
+    updateTrip(tripId, (t) => ({
+      ...t,
+      packing: t.packing.map((p) => (p.id === packId ? { ...p, done: !p.done } : p)),
+    }));
+  const deletePack = (tripId, packId) =>
+    updateTrip(tripId, (t) => ({
+      ...t,
+      packing: t.packing.filter((p) => p.id !== packId),
+    }));
+  const addPack = (tripId) => {
+    const text = (newPackText[tripId] || "").trim();
+    if (!text) return;
+    updateTrip(tripId, (t) => ({
+      ...t,
+      packing: [...t.packing, { id: uid(), text, done: false }],
+    }));
+    setNewPackText((s) => ({ ...s, [tripId]: "" }));
+  };
+  const resetPackFromTemplate = (tripId) => {
+    updateTrip(tripId, (t) => ({
+      ...t,
+      packing: (packingTemplate || []).map((tp) => ({
+        id: uid(),
+        text: tp.text,
+        done: false,
+      })),
+    }));
+    setConfirmResetPack(false);
+  };
+  // Promote a one-off item into the shared template.
+  const addPackToTemplate = (text) => {
+    if ((packingTemplate || []).some((t) => t.text === text)) return;
+    persist({ packingTemplate: [...(packingTemplate || []), { id: uid(), text }] });
+  };
+
+  // ---------- 執行李範本 ----------
+  const addTemplateItem = () => {
+    const text = newTemplateText.trim();
+    if (!text) return;
+    if ((packingTemplate || []).some((t) => t.text === text)) {
+      setNewTemplateText("");
+      return;
+    }
+    persist({ packingTemplate: [...(packingTemplate || []), { id: uid(), text }] });
+    setNewTemplateText("");
+  };
+  const deleteTemplateItem = (id) =>
+    persist({ packingTemplate: (packingTemplate || []).filter((t) => t.id !== id) });
+
+  // ---------- 旅行買嘢 ----------
+  const addTripShop = (tripId) => {
+    const name = (newShopText[tripId] || "").trim();
+    if (!name) return;
+    updateTrip(tripId, (t) => ({
+      ...t,
+      shopping: [
+        ...t.shopping,
+        { id: uid(), name, shop: (newShopWhere[tripId] || "").trim(), done: false },
+      ],
+    }));
+    setNewShopText((s) => ({ ...s, [tripId]: "" }));
+    setNewShopWhere((s) => ({ ...s, [tripId]: "" }));
+  };
+  const toggleTripShop = (tripId, itemId) =>
+    updateTrip(tripId, (t) => ({
+      ...t,
+      shopping: t.shopping.map((i) => (i.id === itemId ? { ...i, done: !i.done } : i)),
+    }));
+  const deleteTripShop = (tripId, itemId) =>
+    updateTrip(tripId, (t) => ({
+      ...t,
+      shopping: t.shopping.filter((i) => i.id !== itemId),
+    }));
+
+  const openTrip = openTripId ? trips.find((t) => t.id === openTripId) : null;
+  const sortedTrips = [...trips].sort((a, b) => {
+    if (!a.start && !b.start) return 0;
+    if (!a.start) return 1;
+    if (!b.start) return -1;
+    return a.start.localeCompare(b.start);
+  });
+
+  const activeListCount = shoppingLists.filter((l) =>
+    l.items.some((it) => !it.done)
+  ).length;
+
+  return (
+    <div className="fh-app">
+      <StyleBlock />
+
+      <header className="fh-header">
+        <div className="fh-header-top">
+          <div className="fh-logo">
+            <HouseMark />
+            <h1>FamilyApp</h1>
+          </div>
+          <button className="fh-sync-btn" onClick={() => fetchData(false)} title="手動同步">
+            <RefreshCw size={15} className={syncing ? "fh-spin" : ""} />
+          </button>
+        </div>
+
+        <nav className="fh-tabs">
+          <button className={"fh-tab-shop " + (tab === "grocery" ? "active" : "")} onClick={() => setTab("grocery")}>
+            <ShoppingBag size={16} />
+            購物清單
+            {activeListCount > 0 && <span className="fh-badge">{activeListCount}</span>}
+          </button>
+          <button className={"fh-tab-travel " + (tab === "travel" ? "active" : "")} onClick={() => setTab("travel")}>
+            <Plane size={16} />
+            旅行計劃
+            {trips.length > 0 && <span className="fh-badge">{trips.length}</span>}
+          </button>
+        </nav>
+      </header>
+
+      <div className="fh-torn" />
+
+      <main className="fh-main">
+        {errorMsg && <div className="fh-error">{errorMsg}</div>}
+
+        {tab === "grocery" && (
+          <section className="fh-shop-section">
+            {wizardOpen ? (
+              <div className="fh-receipt fh-wizard">
+                <div className="fh-wizard-head">
+                  <span>新增購物清單</span>
+                  <button className="fh-wizard-close" onClick={cancelWizard}>
+                    <X size={16} />
+                  </button>
+                </div>
+                <div className="fh-wizard-dots">
+                  {[1, 2, 3, 4].map((n) => (
+                    <span key={n} className={`fh-step-dot ${w.step >= n ? "active" : ""}`} />
+                  ))}
+                </div>
+
+                {w.step === 1 && (
+                  <div className="fh-wizard-body">
+                    <p className="fh-wizard-q">
+                      <Calendar size={15} /> 幾時去買？
+                    </p>
+                    <div className="fh-chip-grid">
+                      <button
+                        className={`fh-chip ${w.date === todayStr ? "active" : ""}`}
+                        onClick={() => pickDate(todayStr)}
+                      >
+                        今日
+                      </button>
+                      <button
+                        className={`fh-chip ${w.date === tomorrowStr ? "active" : ""}`}
+                        onClick={() => pickDate(tomorrowStr)}
+                      >
+                        聽日
+                      </button>
+                      <button
+                        className={`fh-chip ${w.date === satStr ? "active" : ""}`}
+                        onClick={() => pickDate(satStr)}
+                      >
+                        呢個週末
+                      </button>
+                    </div>
+                    <input
+                      type="date"
+                      className="fh-date-input"
+                      value={w.date}
+                      onChange={(e) => pickDate(e.target.value)}
+                    />
+                  </div>
+                )}
+
+                {w.step === 2 && (
+                  <div className="fh-wizard-body">
+                    <p className="fh-wizard-q">
+                      <ShoppingCart size={15} /> 去邊度買？
+                    </p>
+                    <div className="fh-chip-grid">
+                      {OUTLETS.map((o) => (
+                        <button
+                          key={o.key}
+                          className={`fh-chip ${w.outlet === o.key ? "active" : ""}`}
+                          onClick={() => pickOutlet(o.key)}
+                        >
+                          {o.emoji} {o.key}
+                        </button>
+                      ))}
+                      <button
+                        className={`fh-chip ${w.customOutletMode ? "active" : ""}`}
+                        onClick={pickCustomOutlet}
+                      >
+                        ✏️ 其他
+                      </button>
+                    </div>
+                    {w.customOutletMode && (
+                      <input
+                        className="fh-date-input"
+                        placeholder="自訂店舖名稱"
+                        value={w.customOutlet}
+                        onChange={(e) =>
+                          setW((s) => ({ ...s, customOutlet: e.target.value }))
+                        }
+                      />
+                    )}
+                  </div>
+                )}
+
+                {w.step === 3 && (
+                  <div className="fh-wizard-body">
+                    <p className="fh-wizard-q">
+                      <Tag size={15} /> 想買邊類嘢？（可揀多個）
+                    </p>
+                    <div className="fh-chip-grid">
+                      {w.categories
+                        .filter((c) => !CATEGORY_LIST.includes(c))
+                        .concat(CATEGORY_LIST)
+                        .map((cat) => (
+                          <button
+                            key={cat}
+                            className={`fh-chip ${w.categories.includes(cat) ? "active" : ""}`}
+                            onClick={() => toggleCategory(cat)}
+                          >
+                            {CATEGORY_META[cat] || "🏷️"} {cat}
+                          </button>
+                        ))}
+                    </div>
+                    {!w.addingCategory ? (
+                      <button
+                        className="fh-add-custom-chip"
+                        onClick={() => setW((s) => ({ ...s, addingCategory: true }))}
+                      >
+                        <Plus size={13} /> 自訂類別
+                      </button>
+                    ) : (
+                      <div className="fh-inline-add">
+                        <input
+                          autoFocus
+                          placeholder="新類別名稱"
+                          value={w.newCategoryText}
+                          onChange={(e) =>
+                            setW((s) => ({ ...s, newCategoryText: e.target.value }))
+                          }
+                          onKeyDown={(e) => e.key === "Enter" && confirmAddCategory()}
+                        />
+                        <button onClick={confirmAddCategory}>
+                          <Check size={14} />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {w.step === 4 && (
+                  <div className="fh-wizard-body">
+                    <p className="fh-wizard-q">揀貨物</p>
+                    {w.categories.map((cat) => (
+                      <div key={cat} className="fh-wizard-cat-block">
+                        <div className="fh-cat-title">
+                          {CATEGORY_META[cat] || "🏷️"} {cat}
+                        </div>
+                        <div className="fh-chip-grid">
+                          {(PRESET_ITEMS[cat] || []).map((item) => (
+                            <button
+                              key={item}
+                              className={`fh-chip fh-chip-sm ${
+                                (w.itemsByCat[cat] || []).includes(item) ? "active" : ""
+                              }`}
+                              onClick={() => toggleWizardItem(cat, item)}
+                            >
+                              {item}
+                            </button>
+                          ))}
+                        </div>
+                        <div className="fh-inline-add">
+                          <input
+                            placeholder="加其他貨物…"
+                            value={w.customItemText[cat] || ""}
+                            onChange={(e) =>
+                              setW((s) => ({
+                                ...s,
+                                customItemText: { ...s.customItemText, [cat]: e.target.value },
+                              }))
+                            }
+                            onKeyDown={(e) => e.key === "Enter" && confirmAddWizardItem(cat)}
+                          />
+                          <button onClick={() => confirmAddWizardItem(cat)}>
+                            <Plus size={14} />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="fh-wizard-nav">
+                  {w.step > 1 && (
+                    <button className="fh-btn-secondary" onClick={prevStep}>
+                      <ArrowLeft size={14} /> 返回
+                    </button>
+                  )}
+                  {w.step < 4 && (
+                    <button
+                      className="fh-btn-primary"
+                      disabled={!canGoNext}
+                      onClick={nextStep}
+                    >
+                      下一步
+                    </button>
+                  )}
+                  {w.step === 4 && (
+                    <button
+                      className="fh-btn-primary"
+                      disabled={totalWizardItems === 0}
+                      onClick={finishWizard}
+                    >
+                      完成，建立清單（{totalWizardItems}）
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <>
+                <button className="fh-new-trip-btn fh-tone-shop" onClick={startWizard}>
+                  <Plus size={16} /> 開始新購物清單
+                </button>
+
+                {shoppingLists.length > 0 && (
+                  <div className="fh-clear-all-row">
+                    {!confirmClearAll ? (
+                      <button className="fh-clear-all-btn" onClick={() => setConfirmClearAll(true)}>
+                        <Trash2 size={13} /> 清空全部購物清單
+                      </button>
+                    ) : (
+                      <div className="fh-clear-all-confirm">
+                        <span>確定要刪晒全部 {shoppingLists.length} 張清單？</span>
+                        <div className="fh-clear-all-confirm-actions">
+                          <button className="fh-btn-secondary" onClick={() => setConfirmClearAll(false)}>
+                            取消
+                          </button>
+                          <button className="fh-btn-danger" onClick={clearAllShoppingLists}>
+                            確定刪除
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {shoppingLists.length === 0 && (
+                  <div className="fh-quickstart">
+                    <p className="fh-empty">未有購物清單，可以由呢度快速開始：</p>
+                    <div className="fh-chip-grid fh-quickstart-chips">
+                      <button className="fh-chip" onClick={() => quickStartOutlet("Tesco")}>
+                        🛒 Tesco
+                      </button>
+                      <button className="fh-chip" onClick={() => quickStartOutlet("Sainsbury's")}>
+                        🧡 Sainsbury's
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {shoppingLists.length > 0 && (
+                  <button className="fh-chip fh-repeat-chip" onClick={quickStartRepeat}>
+                    <RefreshCw size={12} /> 跟返上次（{shoppingLists[0].outlet}）
+                  </button>
+                )}
+
+                {shoppingLists.map((l) => {
+                  const total = l.items.length;
+                  const done = l.items.filter((i) => i.done).length;
+                  const pct = total ? Math.round((done / total) * 100) : 0;
+                  const expanded = expandedListId === l.id;
+                  const byCat = {};
+                  l.items.forEach((it) => {
+                    (byCat[it.category] = byCat[it.category] || []).push(it);
+                  });
+                  return (
+                    <div key={l.id} className="fh-pass fh-shop-card">
+                      <div className="fh-pass-notch fh-pass-notch-left" />
+                      <div className="fh-pass-notch fh-pass-notch-right" />
+                      <button
+                        className="fh-pass-head"
+                        onClick={() => setExpandedListId(expanded ? null : l.id)}
+                      >
+                        <div className="fh-pass-head-left">
+                          <ShoppingBag size={16} className="fh-shop-icon" />
+                          <div>
+                            <div className="fh-pass-title">{l.outlet}</div>
+                            <div className="fh-pass-sub">
+                              <span className="fh-mono">{displayDate(l.date)}</span>
+                              <span>{l.categories.map((c) => CATEGORY_META[c] || "🏷️").join(" ")}</span>
+                            </div>
+                          </div>
+                        </div>
+                        {expanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+                      </button>
+
+                      <div className="fh-progress-row">
+                        <div className="fh-progress-track">
+                          <div className="fh-progress-fill" style={{ width: `${pct}%` }} />
+                        </div>
+                        <span className="fh-mono fh-progress-label">
+                          {total ? `${done}/${total} 買咗` : "未有貨物"}
+                        </span>
+                      </div>
+
+                      {expanded && (
+                        <div className="fh-pass-body">
+                          <div className="fh-perforation" />
+                          {l.categories.map((cat) => {
+                            const items = byCat[cat] || [];
+                            const remainingPresets = (PRESET_ITEMS[cat] || []).filter(
+                              (p) => !items.some((it) => it.name === p)
+                            );
+                            const key = `${l.id}:${cat}`;
+                            return (
+                              <div key={cat} className="fh-wizard-cat-block">
+                                <div className="fh-cat-title">
+                                  {CATEGORY_META[cat] || "🏷️"} {cat}
+                                </div>
+                                {items.map((it) => (
+                                  <div
+                                    key={it.id}
+                                    className={`fh-task ${it.done ? "fh-item-done" : ""}`}
+                                  >
+                                    <button
+                                      className="fh-check"
+                                      onClick={() => toggleShopItem(l.id, it.id)}
+                                      style={
+                                        it.done
+                                          ? { background: "var(--mustard)", borderColor: "var(--mustard)" }
+                                          : {}
+                                      }
+                                    >
+                                      {it.done && <Check size={12} color="#fff" strokeWidth={3} />}
+                                    </button>
+                                    <span className="fh-item-name">{it.name}</span>
+                                    <button className="fh-del" onClick={() => deleteShopItem(l.id, it.id)}>
+                                      <Trash2 size={13} />
+                                    </button>
+                                  </div>
+                                ))}
+                                {remainingPresets.length > 0 && (
+                                  <div className="fh-chip-grid fh-chip-grid-tight">
+                                    {remainingPresets.map((p) => (
+                                      <button
+                                        key={p}
+                                        className="fh-chip fh-chip-sm"
+                                        onClick={() => addPresetToList(l.id, cat, p)}
+                                      >
+                                        + {p}
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+                                <div className="fh-inline-add">
+                                  <input
+                                    placeholder="加其他貨物…"
+                                    value={extraItemText[key] || ""}
+                                    onChange={(e) =>
+                                      setExtraItemText((s) => ({ ...s, [key]: e.target.value }))
+                                    }
+                                    onKeyDown={(e) => e.key === "Enter" && addCustomToList(l.id, cat)}
+                                  />
+                                  <button onClick={() => addCustomToList(l.id, cat)}>
+                                    <Plus size={14} />
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+
+                          {extend.listId === l.id ? (
+                            <div className="fh-extend-panel">
+                              <div className="fh-perforation" />
+                              {extend.step === "category" && (
+                                <>
+                                  <p className="fh-wizard-q">
+                                    <Tag size={15} /> 想加多邊類？
+                                  </p>
+                                  <div className="fh-chip-grid">
+                                    {extend.categories
+                                      .filter((c) => !CATEGORY_LIST.includes(c))
+                                      .concat(CATEGORY_LIST)
+                                      .filter((c) => !l.categories.includes(c))
+                                      .map((cat) => (
+                                        <button
+                                          key={cat}
+                                          className={`fh-chip ${
+                                            extend.categories.includes(cat) ? "active" : ""
+                                          }`}
+                                          onClick={() => toggleExtendCategory(cat)}
+                                        >
+                                          {CATEGORY_META[cat] || "🏷️"} {cat}
+                                        </button>
+                                      ))}
+                                  </div>
+                                  {!extend.addingCategory ? (
+                                    <button
+                                      className="fh-add-custom-chip"
+                                      onClick={() =>
+                                        setExtend((s) => ({ ...s, addingCategory: true }))
+                                      }
+                                    >
+                                      <Plus size={13} /> 自訂類別
+                                    </button>
+                                  ) : (
+                                    <div className="fh-inline-add">
+                                      <input
+                                        autoFocus
+                                        placeholder="新類別名稱"
+                                        value={extend.newCategoryText}
+                                        onChange={(e) =>
+                                          setExtend((s) => ({
+                                            ...s,
+                                            newCategoryText: e.target.value,
+                                          }))
+                                        }
+                                        onKeyDown={(e) =>
+                                          e.key === "Enter" && confirmAddExtendCategory()
+                                        }
+                                      />
+                                      <button onClick={confirmAddExtendCategory}>
+                                        <Check size={14} />
+                                      </button>
+                                    </div>
+                                  )}
+                                  <div className="fh-wizard-nav">
+                                    <button className="fh-btn-secondary" onClick={closeExtend}>
+                                      取消
+                                    </button>
+                                    <button
+                                      className="fh-btn-primary"
+                                      disabled={extend.categories.length === 0}
+                                      onClick={() =>
+                                        setExtend((s) => ({ ...s, step: "items" }))
+                                      }
+                                    >
+                                      下一步
+                                    </button>
+                                  </div>
+                                </>
+                              )}
+
+                              {extend.step === "items" && (
+                                <>
+                                  <p className="fh-wizard-q">揀貨物</p>
+                                  {extend.categories.map((cat) => (
+                                    <div key={cat} className="fh-wizard-cat-block">
+                                      <div className="fh-cat-title">
+                                        {CATEGORY_META[cat] || "🏷️"} {cat}
+                                      </div>
+                                      <div className="fh-chip-grid">
+                                        {(PRESET_ITEMS[cat] || []).map((item) => (
+                                          <button
+                                            key={item}
+                                            className={`fh-chip fh-chip-sm ${
+                                              (extend.itemsByCat[cat] || []).includes(item)
+                                                ? "active"
+                                                : ""
+                                            }`}
+                                            onClick={() => toggleExtendItem(cat, item)}
+                                          >
+                                            {item}
+                                          </button>
+                                        ))}
+                                      </div>
+                                      <div className="fh-inline-add">
+                                        <input
+                                          placeholder="加其他貨物…"
+                                          value={extend.customItemText[cat] || ""}
+                                          onChange={(e) =>
+                                            setExtend((s) => ({
+                                              ...s,
+                                              customItemText: {
+                                                ...s.customItemText,
+                                                [cat]: e.target.value,
+                                              },
+                                            }))
+                                          }
+                                          onKeyDown={(e) =>
+                                            e.key === "Enter" && confirmAddExtendItem(cat)
+                                          }
+                                        />
+                                        <button onClick={() => confirmAddExtendItem(cat)}>
+                                          <Plus size={14} />
+                                        </button>
+                                      </div>
+                                    </div>
+                                  ))}
+                                  <div className="fh-wizard-nav">
+                                    <button
+                                      className="fh-btn-secondary"
+                                      onClick={() =>
+                                        setExtend((s) => ({ ...s, step: "category" }))
+                                      }
+                                    >
+                                      <ArrowLeft size={14} /> 返回
+                                    </button>
+                                    <button
+                                      className="fh-btn-primary"
+                                      disabled={extendTotalItems === 0}
+                                      onClick={finishExtend}
+                                    >
+                                      加入清單（{extendTotalItems}）
+                                    </button>
+                                  </div>
+                                </>
+                              )}
+                            </div>
+                          ) : (
+                            <button
+                              className="fh-add-custom-chip fh-add-category-btn"
+                              onClick={() => openExtend(l.id)}
+                            >
+                              <Plus size={13} /> 加多個類別
+                            </button>
+                          )}
+
+                          <button className="fh-del-trip" onClick={() => deleteShoppingList(l.id)}>
+                            <Trash2 size={13} /> 刪除呢張清單
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </>
+            )}
+          </section>
+        )}
+
+        {tab === "travel" && (
+          <section className="fh-trips">
+            {/* ---------- Packing template editor ---------- */}
+            {templateOpen ? (
+              <div className="fh-receipt">
+                <div className="fh-wizard-head">
+                  <span>執行李範本</span>
+                  <button className="fh-wizard-close" onClick={() => setTemplateOpen(false)}>
+                    <X size={16} />
+                  </button>
+                </div>
+                <p className="fh-hint">
+                  每次開新旅程，呢張範本會自動複製一份過去。之後喺嗰次旅行度改嘅嘢，唔會影響返呢張範本。
+                </p>
+                {(packingTemplate || []).map((t) => (
+                  <div key={t.id} className="fh-task">
+                    <span className="fh-item-name">{t.text}</span>
+                    <button className="fh-del" onClick={() => deleteTemplateItem(t.id)}>
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
+                ))}
+                <div className="fh-inline-add">
+                  <input
+                    placeholder="加入範本，例如：泳衣"
+                    value={newTemplateText}
+                    onChange={(e) => setNewTemplateText(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && addTemplateItem()}
+                  />
+                  <button onClick={addTemplateItem}>
+                    <Plus size={14} />
+                  </button>
+                </div>
+              </div>
+            ) : openTrip ? (
+              /* ---------- Trip detail ---------- */
+              <div className="fh-trip-detail">
+                <button
+                  className="fh-back-btn"
+                  onClick={() => {
+                    setOpenTripId(null);
+                    setEditTripDraft(null);
+                  }}
+                >
+                  <ArrowLeft size={15} /> 所有旅程
+                </button>
+
+                <div className="fh-trip-title-row">
+                  <Plane size={18} className="fh-plane-icon" />
+                  <div className="fh-trip-title-main">
+                    <div className="fh-trip-title">{openTrip.title}</div>
+                    {editTripDraft ? null : (
+                      <>
+                        {(openTrip.place || openTrip.start) && (
+                          <div className="fh-pass-sub">
+                            {openTrip.place && (
+                              <span>
+                                <MapPin size={11} /> {openTrip.place}
+                              </span>
+                            )}
+                            {openTrip.start && (
+                              <span className="fh-mono">
+                                {openTrip.start}
+                                {openTrip.end ? " – " + openTrip.end : ""}
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                  {!editTripDraft && (
+                    <button
+                      className="fh-edit-trip-btn"
+                      onClick={() => startEditTrip(openTrip)}
+                      title="編輯地方同日子"
+                    >
+                      <Pencil size={14} />
+                    </button>
+                  )}
+                </div>
+
+                {editTripDraft && (
+                  <div className="fh-edit-trip-form">
+                    <input
+                      placeholder="目的地"
+                      value={editTripDraft.place}
+                      onChange={(e) =>
+                        setEditTripDraft((s) => ({ ...s, place: e.target.value }))
+                      }
+                    />
+                    <div className="fh-date-row">
+                      <input
+                        type="date"
+                        value={editTripDraft.start}
+                        onChange={(e) =>
+                          setEditTripDraft((s) => ({ ...s, start: e.target.value }))
+                        }
+                      />
+                      <span>至</span>
+                      <input
+                        type="date"
+                        value={editTripDraft.end}
+                        onChange={(e) =>
+                          setEditTripDraft((s) => ({ ...s, end: e.target.value }))
+                        }
+                      />
+                    </div>
+                    <div className="fh-new-trip-actions">
+                      <button className="fh-btn-secondary" onClick={cancelEditTrip}>
+                        取消
+                      </button>
+                      <button
+                        className="fh-btn-primary"
+                        onClick={() => saveEditTrip(openTrip.id)}
+                      >
+                        儲存
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <div className="fh-segmented">
+                  <button
+                    className={tripTab === "itinerary" ? "active" : ""}
+                    onClick={() => setTripTab("itinerary")}
+                  >
+                    行程
+                  </button>
+                  <button
+                    className={tripTab === "todo" ? "active" : ""}
+                    onClick={() => setTripTab("todo")}
+                  >
+                    To-do list
+                    {openTrip.items.filter((i) => !i.done).length > 0 && (
+                      <span className="fh-seg-count">
+                        {openTrip.items.filter((i) => !i.done).length}
+                      </span>
+                    )}
+                  </button>
+                  <button
+                    className={tripTab === "packing" ? "active" : ""}
+                    onClick={() => setTripTab("packing")}
+                  >
+                    執嘢
+                    {openTrip.packing.filter((p) => !p.done).length > 0 && (
+                      <span className="fh-seg-count">
+                        {openTrip.packing.filter((p) => !p.done).length}
+                      </span>
+                    )}
+                  </button>
+                  <button
+                    className={tripTab === "shop" ? "active" : ""}
+                    onClick={() => setTripTab("shop")}
+                  >
+                    買嘢
+                    {openTrip.shopping.filter((i) => !i.done).length > 0 && (
+                      <span className="fh-seg-count">
+                        {openTrip.shopping.filter((i) => !i.done).length}
+                      </span>
+                    )}
+                  </button>
+                </div>
+
+                <div className="fh-receipt">
+                  {tripTab === "itinerary" && (
+                    <>
+                      {(openTrip.days || []).length === 0 && (
+                        <p className="fh-empty">未有行程，撳下面「+」加第一日。</p>
+                      )}
+                      {(openTrip.days || []).map((day, idx) => (
+                        <div key={day.id} className="fh-day-block">
+                          <div className="fh-day-head">
+                            <span className="fh-day-label">Day {idx + 1}</span>
+                            <button
+                              className="fh-del"
+                              onClick={() => removeDay(openTrip.id, day.id)}
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
+                          <div className="fh-day-field">
+                            <span className="fh-day-field-label">早</span>
+                            <textarea
+                              rows={2}
+                              placeholder="早上做咩？"
+                              value={getDayFieldValue(openTrip.id, day, "morning")}
+                              onChange={(e) =>
+                                onDayFieldChange(openTrip.id, day.id, "morning", e.target.value)
+                              }
+                              onBlur={() => commitDayField(openTrip.id, day.id, "morning")}
+                            />
+                          </div>
+                          <div className="fh-day-field">
+                            <span className="fh-day-field-label">午</span>
+                            <textarea
+                              rows={2}
+                              placeholder="下晝做咩？"
+                              value={getDayFieldValue(openTrip.id, day, "afternoon")}
+                              onChange={(e) =>
+                                onDayFieldChange(openTrip.id, day.id, "afternoon", e.target.value)
+                              }
+                              onBlur={() => commitDayField(openTrip.id, day.id, "afternoon")}
+                            />
+                          </div>
+                          <div className="fh-day-field">
+                            <span className="fh-day-field-label">晚</span>
+                            <textarea
+                              rows={2}
+                              placeholder="夜晚做咩？"
+                              value={getDayFieldValue(openTrip.id, day, "evening")}
+                              onChange={(e) =>
+                                onDayFieldChange(openTrip.id, day.id, "evening", e.target.value)
+                              }
+                              onBlur={() => commitDayField(openTrip.id, day.id, "evening")}
+                            />
+                          </div>
+                          <div className="fh-day-field">
+                            <span className="fh-day-field-label">住</span>
+                            <textarea
+                              rows={2}
+                              placeholder="住宿 / 酒店"
+                              value={getDayFieldValue(openTrip.id, day, "stay")}
+                              onChange={(e) =>
+                                onDayFieldChange(openTrip.id, day.id, "stay", e.target.value)
+                              }
+                              onBlur={() => commitDayField(openTrip.id, day.id, "stay")}
+                            />
+                          </div>
+                        </div>
+                      ))}
+                      <button className="fh-add-day-btn" onClick={() => addDay(openTrip.id)}>
+                        <Plus size={15} /> 加多日（Day {(openTrip.days || []).length + 1}）
+                      </button>
+                    </>
+                  )}
+
+                  {tripTab === "todo" && (
+                    <>
+                      {openTrip.items.length === 0 && (
+                        <p className="fh-empty">未有待辦，例如：訂機票、換錢、租wifi蛋。</p>
+                      )}
+                      {openTrip.items.map((it) => (
+                        <div key={it.id} className={"fh-task " + (it.done ? "fh-item-done" : "")}>
+                          <button
+                            className="fh-check"
+                            onClick={() => toggleTask(openTrip.id, it.id)}
+                            style={
+                              it.done
+                                ? { background: "var(--mustard)", borderColor: "var(--mustard)" }
+                                : {}
+                            }
+                          >
+                            {it.done && <Check size={12} color="#fff" strokeWidth={3} />}
+                          </button>
+                          <span className="fh-item-name">{it.text}</span>
+                          <button className="fh-del" onClick={() => deleteTask(openTrip.id, it.id)}>
+                            <Trash2 size={13} />
+                          </button>
+                        </div>
+                      ))}
+                      <div className="fh-inline-add">
+                        <input
+                          placeholder="新增待辦，例如：訂機票"
+                          value={newTaskText[openTrip.id] || ""}
+                          onChange={(e) =>
+                            setNewTaskText((s) => ({ ...s, [openTrip.id]: e.target.value }))
+                          }
+                          onKeyDown={(e) => e.key === "Enter" && addTask(openTrip.id)}
+                        />
+                        <button onClick={() => addTask(openTrip.id)}>
+                          <Plus size={14} />
+                        </button>
+                      </div>
+                    </>
+                  )}
+
+                  {tripTab === "packing" && (
+                    <>
+                      <div className="fh-pack-head">
+                        <span className="fh-mono">
+                          {openTrip.packing.filter((p) => p.done).length}/{openTrip.packing.length} 執好
+                        </span>
+                        <button className="fh-link-btn" onClick={() => setTemplateOpen(true)}>
+                          編輯範本
+                        </button>
+                      </div>
+                      {openTrip.packing.map((p) => {
+                        const inTemplate = (packingTemplate || []).some(
+                          (t) => t.text === p.text
+                        );
+                        return (
+                          <div key={p.id} className={"fh-task " + (p.done ? "fh-item-done" : "")}>
+                            <button
+                              className="fh-check"
+                              onClick={() => togglePack(openTrip.id, p.id)}
+                              style={
+                                p.done
+                                  ? { background: "var(--mustard)", borderColor: "var(--mustard)" }
+                                  : {}
+                              }
+                            >
+                              {p.done && <Check size={12} color="#fff" strokeWidth={3} />}
+                            </button>
+                            <span className="fh-item-name">{p.text}</span>
+                            {!inTemplate && (
+                              <button
+                                className="fh-tiny-btn"
+                                title="加返入範本"
+                                onClick={() => addPackToTemplate(p.text)}
+                              >
+                                +範本
+                              </button>
+                            )}
+                            <button className="fh-del" onClick={() => deletePack(openTrip.id, p.id)}>
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
+                        );
+                      })}
+                      <div className="fh-inline-add">
+                        <input
+                          placeholder="今次要帶多啲咩？"
+                          value={newPackText[openTrip.id] || ""}
+                          onChange={(e) =>
+                            setNewPackText((s) => ({ ...s, [openTrip.id]: e.target.value }))
+                          }
+                          onKeyDown={(e) => e.key === "Enter" && addPack(openTrip.id)}
+                        />
+                        <button onClick={() => addPack(openTrip.id)}>
+                          <Plus size={14} />
+                        </button>
+                      </div>
+                      {!confirmResetPack ? (
+                        <button
+                          className="fh-link-btn fh-reset-link"
+                          onClick={() => setConfirmResetPack(true)}
+                        >
+                          由範本重新載入
+                        </button>
+                      ) : (
+                        <div className="fh-clear-all-confirm">
+                          <span>會清走今次改過嘅嘢，用返範本？</span>
+                          <div className="fh-clear-all-confirm-actions">
+                            <button
+                              className="fh-btn-secondary"
+                              onClick={() => setConfirmResetPack(false)}
+                            >
+                              取消
+                            </button>
+                            <button
+                              className="fh-btn-danger"
+                              onClick={() => resetPackFromTemplate(openTrip.id)}
+                            >
+                              確定
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {tripTab === "shop" && (
+                    <>
+                      {openTrip.shopping.length === 0 && (
+                        <p className="fh-empty">未有想買嘅嘢。手信、藥妝、限定版都可以擺喺呢度。</p>
+                      )}
+                      {openTrip.shopping.map((i) => (
+                        <div key={i.id} className={"fh-task fh-shop-item-row " + (i.done ? "fh-item-done" : "")}>
+                          <button
+                            className="fh-check"
+                            onClick={() => toggleTripShop(openTrip.id, i.id)}
+                            style={
+                              i.done
+                                ? { background: "var(--mustard)", borderColor: "var(--mustard)" }
+                                : {}
+                            }
+                          >
+                            {i.done && <Check size={12} color="#fff" strokeWidth={3} />}
+                          </button>
+
+                          {i.photo ? (
+                            <div className="fh-thumb-wrap">
+                              <img
+                                src={i.photo}
+                                className="fh-thumb"
+                                onClick={() => setViewPhoto(i.photo)}
+                                alt=""
+                              />
+                              <button
+                                className="fh-thumb-remove"
+                                onClick={() => removeShopPhoto(openTrip.id, i.id)}
+                                title="移除相片"
+                              >
+                                <X size={10} />
+                              </button>
+                            </div>
+                          ) : (
+                            <label className="fh-photo-add-btn" title="加相片">
+                              <Camera size={15} />
+                              <input
+                                type="file"
+                                accept="image/*"
+                                onChange={(e) => {
+                                  attachShopPhoto(openTrip.id, i.id, e.target.files[0]);
+                                  e.target.value = "";
+                                }}
+                              />
+                            </label>
+                          )}
+
+                          <span className="fh-item-name">
+                            {i.name}
+                            {i.shop && <span className="fh-shop-tag">{i.shop}</span>}
+                          </span>
+                          <button
+                            className="fh-del"
+                            onClick={() => deleteTripShop(openTrip.id, i.id)}
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </div>
+                      ))}
+                      <div className="fh-inline-add fh-inline-add-shop">
+                        <input
+                          className="fh-shop-name-input"
+                          placeholder="想買咩？"
+                          value={newShopText[openTrip.id] || ""}
+                          onChange={(e) =>
+                            setNewShopText((s) => ({ ...s, [openTrip.id]: e.target.value }))
+                          }
+                          onKeyDown={(e) => e.key === "Enter" && addTripShop(openTrip.id)}
+                        />
+                        <input
+                          className="fh-shop-where-input"
+                          placeholder="邊度買（可選）"
+                          value={newShopWhere[openTrip.id] || ""}
+                          onChange={(e) =>
+                            setNewShopWhere((s) => ({ ...s, [openTrip.id]: e.target.value }))
+                          }
+                          onKeyDown={(e) => e.key === "Enter" && addTripShop(openTrip.id)}
+                        />
+                        <button onClick={() => addTripShop(openTrip.id)}>
+                          <Plus size={14} />
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                <button className="fh-del-trip" onClick={() => deleteTrip(openTrip.id)}>
+                  <Trash2 size={13} /> 刪除呢個旅程
+                </button>
+              </div>
+            ) : (
+              /* ---------- Trip list ---------- */
+              <>
+                {trips.length === 0 && !showNewTrip && (
+                  <p className="fh-empty">未有旅行計劃，撳下面「新增旅程」開始計劃啦！</p>
+                )}
+
+                {sortedTrips.map((t) => {
+                  const packDone = t.packing.filter((p) => p.done).length;
+                  const packTotal = t.packing.length;
+                  const pct = packTotal ? Math.round((packDone / packTotal) * 100) : 0;
+                  const todoLeft = t.items.filter((i) => !i.done).length;
+                  const shopLeft = t.shopping.filter((i) => !i.done).length;
+                  return (
+                    <div key={t.id} className="fh-pass">
+                      <div className="fh-pass-notch fh-pass-notch-left" />
+                      <div className="fh-pass-notch fh-pass-notch-right" />
+                      <button
+                        className="fh-pass-head"
+                        onClick={() => {
+                          setOpenTripId(t.id);
+                          setTripTab("itinerary");
+                          setConfirmResetPack(false);
+                          setEditTripDraft(null);
+                        }}
+                      >
+                        <div className="fh-pass-head-left">
+                          <Plane size={16} className="fh-plane-icon" />
+                          <div>
+                            <div className="fh-pass-title">{t.title}</div>
+                            {(t.place || t.start) && (
+                              <div className="fh-pass-sub">
+                                {t.place && (
+                                  <span>
+                                    <MapPin size={11} /> {t.place}
+                                  </span>
+                                )}
+                                {t.start && (
+                                  <span className="fh-mono">
+                                    {t.start}
+                                    {t.end ? " – " + t.end : ""}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                        <ChevronDown size={16} style={{ transform: "rotate(-90deg)" }} />
+                      </button>
+
+                      <div className="fh-progress-row">
+                        <div className="fh-progress-track">
+                          <div className="fh-progress-fill fh-progress-fill-travel" style={{ width: pct + "%" }} />
+                        </div>
+                        <span className="fh-mono fh-progress-label">
+                          {packTotal ? packDone + "/" + packTotal + " 執好" : "未有行李"}
+                        </span>
+                      </div>
+
+                      {(todoLeft > 0 || shopLeft > 0) && (
+                        <div className="fh-trip-meta">
+                          {todoLeft > 0 && <span>行程待辦 {todoLeft}</span>}
+                          {shopLeft > 0 && <span>想買 {shopLeft}</span>}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {showNewTrip ? (
+                  <div className="fh-pass fh-pass-new">
+                    <div className="fh-pass-notch fh-pass-notch-left" />
+                    <div className="fh-pass-notch fh-pass-notch-right" />
+                    <div className="fh-new-trip-form">
+                      <input
+                        placeholder="旅程名稱，例如：日本"
+                        value={newTripTitle}
+                        onChange={(e) => setNewTripTitle(e.target.value)}
+                      />
+                      <input
+                        placeholder="目的地（可選）"
+                        value={newTripPlace}
+                        onChange={(e) => setNewTripPlace(e.target.value)}
+                      />
+                      <div className="fh-date-row">
+                        <input
+                          type="date"
+                          value={newTripStart}
+                          onChange={(e) => setNewTripStart(e.target.value)}
+                        />
+                        <span>至</span>
+                        <input
+                          type="date"
+                          value={newTripEnd}
+                          onChange={(e) => setNewTripEnd(e.target.value)}
+                        />
+                      </div>
+                      <p className="fh-hint">
+                        建立之後會自動由範本複製 {(packingTemplate || []).length} 樣執行李嘅嘢過去。
+                      </p>
+                      <div className="fh-new-trip-actions">
+                        <button className="fh-btn-secondary" onClick={() => setShowNewTrip(false)}>
+                          取消
+                        </button>
+                        <button className="fh-btn-primary" onClick={addTrip}>
+                          建立旅程
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <button className="fh-new-trip-btn fh-tone-travel" onClick={() => setShowNewTrip(true)}>
+                    <Plus size={16} /> 新增旅程
+                  </button>
+                )}
+
+                <button className="fh-template-btn" onClick={() => setTemplateOpen(true)}>
+                  執行李範本（{(packingTemplate || []).length} 樣）
+                </button>
+              </>
+            )}
+          </section>
+        )}
+      </main>
+
+      {viewPhoto && (
+        <div className="fh-lightbox" onClick={() => setViewPhoto(null)}>
+          <img src={viewPhoto} alt="" />
+          <button className="fh-lightbox-close" onClick={() => setViewPhoto(null)}>
+            <X size={18} />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HouseMark() {
+  return (
+    <svg viewBox="0 0 100 100" width="30" height="30" fill="none" className="fh-logo-mark">
+      <path
+        d="M50 16 L83 50 L83 84 L17 84 L17 50 Z"
+        stroke="var(--coral)"
+        strokeWidth="8"
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+      <path
+        d="M40 84 L40 60 A10 10 0 0 1 60 60 L60 84"
+        stroke="var(--coral)"
+        strokeWidth="8"
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function StyleBlock() {
+  return (
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;700;800&family=Noto+Sans+TC:wght@400;500;700&family=JetBrains+Mono:wght@500;600&display=swap');
+
+      .fh-app {
+        --paper: #FAF6EF;
+        --paper-alt: #F1E9DA;
+        --card: #FFFCF7;
+        --ink: #4A2C23;
+        --ink-soft: #8A7268;
+        --vermillion: #C75B39;
+        --ember: #7B2D26;
+        --mustard: #D9A15B;
+        --red: #A83232;
+        --clay: #A8703D;
+        --coral: #E8785C;
+        --accent: #2C4A5E;
+        --accent-l: #4A7189;
+        --line: #E8DFD2;
+
+        font-family: 'Noto Sans TC', 'PingFang HK', 'Microsoft JhengHei', sans-serif;
+        color: var(--ink);
+        background: var(--paper);
+        width: 100%;
+        max-width: 430px;
+        margin: 0 auto;
+        border-radius: 18px;
+        overflow: hidden;
+        box-shadow: 0 1px 3px rgba(43,36,32,0.08);
+        display: flex;
+        flex-direction: column;
+        min-height: 560px;
+        position: relative;
+      }
+
+      .fh-app * { box-sizing: border-box; }
+      .fh-mono { font-family: 'JetBrains Mono', monospace; }
+
+      .fh-loading { align-items: center; justify-content: center; min-height: 400px; }
+      .fh-loading-inner { text-align: center; color: var(--ink-soft); }
+      .fh-spinner {
+        width: 26px; height: 26px; margin: 0 auto 10px;
+        border: 3px solid var(--line); border-top-color: var(--vermillion);
+        border-radius: 50%; animation: fh-rotate 0.8s linear infinite;
+      }
+      @keyframes fh-rotate { to { transform: rotate(360deg); } }
+      .fh-spin { animation: fh-rotate 0.9s linear infinite; }
+
+      .fh-header {
+        background: var(--paper-alt);
+        border-bottom: 1px solid var(--line);
+        padding: 16px 16px 0;
+      }
+      .fh-header-top { display: flex; align-items: center; justify-content: space-between; }
+      .fh-logo { display: flex; gap: 8px; align-items: center; }
+      .fh-logo-mark { flex-shrink: 0; }
+      .fh-logo h1 {
+        font-family: 'Baloo 2', sans-serif;
+        font-size: 19px;
+        font-weight: 700;
+        margin: 0;
+        color: var(--coral);
+        letter-spacing: 0.2px;
+      }
+      .fh-sync-btn {
+        background: var(--paper);
+        border: 1px solid var(--line);
+        color: var(--ink-soft);
+        width: 30px; height: 30px; border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+        cursor: pointer; flex-shrink: 0;
+      }
+
+      .fh-tabs {
+        display: flex;
+        margin-top: 14px;
+        gap: 4px;
+      }
+      .fh-tabs button {
+        flex: 1;
+        background: var(--paper);
+        border: 1px solid var(--line);
+        border-bottom: none;
+        color: var(--ink-soft);
+        padding: 10px 8px;
+        border-radius: 10px 10px 0 0;
+        font-size: 13px;
+        font-weight: 500;
+        display: flex; align-items: center; justify-content: center; gap: 6px;
+        cursor: pointer;
+        position: relative;
+      }
+      .fh-tabs button.active {
+        color: #fff;
+        font-weight: 700;
+      }
+      .fh-tabs button.fh-tab-shop.active {
+        background: var(--ember);
+        border-color: var(--ember);
+      }
+      .fh-tabs button.fh-tab-travel.active {
+        background: var(--accent);
+        border-color: var(--accent);
+      }
+      .fh-badge {
+        background: var(--red);
+        color: #fff;
+        font-size: 10px;
+        font-weight: 700;
+        border-radius: 8px;
+        padding: 1px 5px;
+        min-width: 16px;
+      }
+      .fh-tabs button.active .fh-badge { background: rgba(255,255,255,0.28); }
+
+      .fh-torn {
+        height: 6px;
+        background-image: linear-gradient(135deg, var(--paper) 25%, transparent 25.5%), linear-gradient(225deg, var(--paper) 25%, transparent 25.5%);
+        background-size: 10px 6px;
+        background-repeat: repeat-x;
+        background-color: var(--ember);
+      }
+
+      .fh-main { flex: 1; overflow-y: auto; padding: 14px 14px 20px; }
+      .fh-error {
+        background: #FBEAEA; color: var(--red); border: 1px solid #F0C4C4;
+        padding: 8px 10px; border-radius: 8px; font-size: 12px; margin-bottom: 10px;
+      }
+      .fh-empty { color: var(--ink-soft); font-size: 13px; text-align: center; padding: 30px 10px; }
+
+      .fh-shop-section { display: flex; flex-direction: column; gap: 12px; }
+
+      .fh-receipt {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 14px;
+      }
+
+      .fh-wizard-head {
+        display: flex; justify-content: space-between; align-items: center;
+        font-family: 'Baloo 2', sans-serif; font-weight: 700; font-size: 15px;
+        border-bottom: 1px dashed var(--line);
+        padding-bottom: 8px; margin-bottom: 10px;
+      }
+      .fh-wizard-close { background: none; border: none; color: var(--ink-soft); cursor: pointer; display: flex; }
+      .fh-wizard-dots { display: flex; gap: 5px; margin-bottom: 14px; }
+      .fh-step-dot {
+        height: 5px; flex: 1; background: var(--paper-alt); border-radius: 3px;
+      }
+      .fh-step-dot.active { background: var(--vermillion); }
+
+      .fh-wizard-q {
+        display: flex; align-items: center; gap: 6px;
+        font-size: 13.5px; font-weight: 600; margin: 0 0 10px;
+        color: var(--ember);
+      }
+      .fh-wizard-body { margin-bottom: 12px; }
+      .fh-wizard-cat-block { margin-bottom: 16px; }
+      .fh-wizard-cat-block:last-child { margin-bottom: 4px; }
+
+      .fh-chip-grid { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 8px; }
+      .fh-chip-grid-tight { margin-top: 4px; margin-bottom: 8px; }
+      .fh-chip {
+        border: 1.5px solid var(--line);
+        background: var(--card);
+        color: var(--ink);
+        font-size: 12.5px;
+        padding: 7px 12px;
+        border-radius: 20px;
+        cursor: pointer;
+      }
+      .fh-chip-sm { font-size: 11.5px; padding: 5px 10px; color: var(--ink-soft); }
+      .fh-chip.active {
+        border-color: var(--vermillion);
+        background: var(--vermillion);
+        color: #fff;
+        font-weight: 600;
+      }
+      .fh-add-custom-chip {
+        border: 1.5px dashed var(--line);
+        background: none;
+        color: var(--ink-soft);
+        font-size: 12px;
+        padding: 6px 12px;
+        border-radius: 20px;
+        cursor: pointer;
+        display: inline-flex; align-items: center; gap: 4px;
+      }
+
+      .fh-date-input {
+        width: 100%; border: 1px solid var(--line); border-radius: 8px;
+        padding: 9px 10px; font-size: 13px; font-family: inherit; color: var(--ink);
+      }
+
+      .fh-inline-add { display: flex; gap: 6px; margin-top: 4px; }
+      .fh-inline-add input {
+        flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 7px;
+        padding: 7px 9px; font-size: 12.5px; font-family: inherit;
+      }
+      .fh-inline-add button {
+        background: var(--vermillion); color: #fff; border: none;
+        border-radius: 7px; width: 32px; display: flex; align-items: center; justify-content: center;
+        cursor: pointer; flex-shrink: 0;
+      }
+      .fh-inline-add-shop .fh-shop-name-input { flex: 1.4; }
+      .fh-inline-add-shop .fh-shop-where-input { flex: 1; }
+
+      .fh-wizard-nav { display: flex; gap: 8px; padding-top: 10px; border-top: 1px dashed var(--line); }
+      .fh-wizard-nav .fh-btn-secondary { flex: 0 0 auto; padding: 9px 14px; display: flex; align-items: center; gap: 4px; }
+      .fh-wizard-nav .fh-btn-primary { flex: 1; }
+      .fh-btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+      .fh-cat-title {
+        font-size: 12px; font-weight: 700; margin-bottom: 6px;
+        display: flex; align-items: center; gap: 5px;
+        color: var(--ember);
+      }
+      .fh-item-name { flex: 1; font-size: 13.5px; }
+      .fh-item-done { opacity: 0.5; }
+      .fh-item-done .fh-item-name { text-decoration: line-through; }
+      .fh-check {
+        width: 20px; height: 20px; border-radius: 50%;
+        border: 2px solid var(--ink-soft);
+        background: transparent;
+        display: flex; align-items: center; justify-content: center;
+        cursor: pointer; flex-shrink: 0; padding: 0;
+      }
+      .fh-del {
+        background: none; border: none; color: var(--ink-soft);
+        cursor: pointer; padding: 2px; display: flex;
+      }
+      .fh-del:hover { color: var(--red); }
+
+      .fh-trips { display: flex; flex-direction: column; gap: 12px; }
+      .fh-pass {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        position: relative;
+        overflow: hidden;
+      }
+      .fh-pass-notch {
+        position: absolute; top: 46px;
+        width: 14px; height: 14px;
+        background: var(--paper);
+        border: 1px solid var(--line);
+        border-radius: 50%;
+      }
+      .fh-pass-notch-left { left: -8px; }
+      .fh-pass-notch-right { right: -8px; }
+
+      .fh-pass-head {
+        width: 100%;
+        background: none; border: none;
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 12px 16px;
+        cursor: pointer;
+        color: var(--ink);
+      }
+      .fh-pass-head-left { display: flex; align-items: center; gap: 10px; text-align: left; }
+      .fh-plane-icon { color: var(--accent); flex-shrink: 0; transform: rotate(45deg); }
+      .fh-shop-icon { color: var(--vermillion); flex-shrink: 0; }
+      .fh-pass-title { font-family: 'Baloo 2', sans-serif; font-weight: 700; font-size: 14.5px; }
+      .fh-pass-sub {
+        display: flex; gap: 10px; margin-top: 2px;
+        font-size: 11px; color: var(--ink-soft);
+      }
+      .fh-pass-sub span { display: flex; align-items: center; gap: 2px; }
+
+      .fh-progress-row {
+        display: flex; align-items: center; gap: 8px;
+        padding: 0 16px 12px;
+      }
+      .fh-progress-track {
+        flex: 1; height: 6px; background: var(--paper-alt);
+        border-radius: 3px; overflow: hidden;
+      }
+      .fh-progress-fill {
+        height: 100%; background: linear-gradient(90deg, var(--mustard), var(--vermillion));
+        border-radius: 3px; transition: width 0.3s;
+      }
+      .fh-progress-fill.fh-progress-fill-travel {
+        background: linear-gradient(90deg, var(--accent-l), var(--accent));
+      }
+      .fh-progress-label { font-size: 10px; color: var(--ink-soft); white-space: nowrap; }
+
+      .fh-perforation {
+        height: 1px;
+        background-image: repeating-linear-gradient(90deg, var(--line) 0 6px, transparent 6px 12px);
+        margin: 0 16px 12px;
+      }
+      .fh-pass-body { padding: 0 16px 14px; }
+      .fh-task {
+        display: flex; align-items: center; gap: 8px;
+        padding: 6px 0;
+      }
+      .fh-task .fh-item-name { font-size: 13px; }
+
+      .fh-add-task {
+        display: flex; gap: 6px; margin-top: 8px;
+      }
+      .fh-add-task input {
+        flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 7px;
+        padding: 7px 9px; font-size: 12.5px; font-family: inherit;
+      }
+      .fh-add-task button {
+        background: var(--vermillion); color: #fff; border: none;
+        border-radius: 7px; width: 32px; display: flex; align-items: center; justify-content: center;
+        cursor: pointer;
+      }
+      .fh-extend-panel { margin-top: 4px; }
+      .fh-add-category-btn { width: 100%; justify-content: center; margin-bottom: 6px; }
+      .fh-del-trip {
+        margin-top: 10px; background: none; border: none;
+        color: var(--red); font-size: 11.5px; cursor: pointer;
+        display: flex; align-items: center; gap: 4px; padding: 0;
+      }
+
+      .fh-trip-detail { display: flex; flex-direction: column; gap: 12px; }
+      .fh-back-btn {
+        background: none; border: none; color: var(--accent);
+        font-size: 12.5px; font-weight: 600; cursor: pointer;
+        display: flex; align-items: center; gap: 4px; padding: 0;
+        align-self: flex-start;
+      }
+      .fh-trip-title-row { display: flex; align-items: center; gap: 10px; }
+      .fh-trip-title-main { flex: 1; min-width: 0; }
+      .fh-edit-trip-btn {
+        flex-shrink: 0;
+        width: 28px; height: 28px; border-radius: 50%;
+        border: 1px solid var(--line); background: var(--card);
+        color: var(--ink-soft);
+        display: flex; align-items: center; justify-content: center;
+        cursor: pointer;
+      }
+      .fh-edit-trip-form {
+        background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+        padding: 12px; display: flex; flex-direction: column; gap: 8px;
+      }
+      .fh-edit-trip-form input[type="text"],
+      .fh-edit-trip-form > input:not([type]) {
+        border: 1px solid var(--line); border-radius: 8px;
+        padding: 8px 10px; font-size: 13px; font-family: inherit;
+      }
+      .fh-trip-title {
+        font-family: 'Baloo 2', sans-serif; font-weight: 700; font-size: 18px;
+      }
+
+      .fh-day-block {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 10px 12px;
+        margin-bottom: 10px;
+        background: var(--paper-alt);
+      }
+      .fh-day-head {
+        display: flex; align-items: center; justify-content: space-between;
+        margin-bottom: 8px;
+      }
+      .fh-day-label {
+        font-family: 'Baloo 2', sans-serif; font-weight: 700; font-size: 13px;
+        color: var(--accent);
+      }
+      .fh-day-field { display: flex; gap: 8px; margin-bottom: 6px; align-items: flex-start; }
+      .fh-day-field:last-child { margin-bottom: 0; }
+      .fh-day-field-label {
+        flex-shrink: 0; width: 20px; padding-top: 8px;
+        font-size: 12px; font-weight: 700; color: var(--ink-soft); text-align: center;
+      }
+      .fh-day-field textarea {
+        flex: 1; border: 1px solid var(--line); border-radius: 8px;
+        padding: 7px 9px; font-size: 13px; font-family: inherit; color: var(--ink);
+        background: var(--card); resize: vertical; min-height: 36px;
+      }
+      .fh-add-day-btn {
+        width: 100%;
+        border: 2px dashed var(--line); background: none;
+        color: var(--accent); font-family: inherit;
+        font-weight: 600; font-size: 13px;
+        padding: 10px; border-radius: 12px; cursor: pointer;
+        display: flex; align-items: center; justify-content: center; gap: 6px;
+      }
+
+      .fh-shop-item-row { align-items: center; }
+      .fh-photo-add-btn {
+        flex-shrink: 0;
+        width: 30px; height: 30px; border-radius: 8px;
+        border: 1.5px dashed var(--line);
+        color: var(--ink-soft);
+        display: flex; align-items: center; justify-content: center;
+        cursor: pointer;
+      }
+      .fh-photo-add-btn input { display: none; }
+      .fh-thumb-wrap { position: relative; flex-shrink: 0; }
+      .fh-thumb {
+        width: 30px; height: 30px; border-radius: 8px;
+        object-fit: cover; cursor: pointer; display: block;
+        border: 1px solid var(--line);
+      }
+      .fh-thumb-remove {
+        position: absolute; top: -5px; right: -5px;
+        width: 15px; height: 15px; border-radius: 50%;
+        background: var(--red); color: #fff; border: 1.5px solid var(--card);
+        display: flex; align-items: center; justify-content: center;
+        cursor: pointer; padding: 0;
+      }
+
+      .fh-lightbox {
+        position: fixed; inset: 0; z-index: 1000;
+        background: rgba(20,14,10,0.9);
+        display: flex; align-items: center; justify-content: center;
+        padding: 24px; cursor: zoom-out;
+      }
+      .fh-lightbox img {
+        max-width: 100%; max-height: 100%;
+        border-radius: 10px; object-fit: contain;
+      }
+      .fh-lightbox-close {
+        position: absolute; top: 16px; right: 16px;
+        width: 34px; height: 34px; border-radius: 50%;
+        background: rgba(255,255,255,0.15); border: none; color: #fff;
+        display: flex; align-items: center; justify-content: center; cursor: pointer;
+      }
+
+      .fh-segmented {
+        display: flex; gap: 4px;
+        background: var(--paper-alt);
+        padding: 4px; border-radius: 10px;
+      }
+      .fh-segmented button {
+        flex: 1; border: none; background: none;
+        color: var(--ink-soft); font-family: inherit;
+        font-size: 11px; font-weight: 600;
+        padding: 8px 2px; border-radius: 7px; cursor: pointer;
+        display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+        line-height: 1.15;
+      }
+      .fh-segmented button.active { background: var(--card); color: var(--accent); box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+      .fh-seg-count {
+        background: var(--accent); color: #fff;
+        font-size: 10px; border-radius: 8px; padding: 0 5px; min-width: 15px;
+      }
+      .fh-pack-head {
+        display: flex; justify-content: space-between; align-items: center;
+        padding-bottom: 8px; margin-bottom: 6px;
+        border-bottom: 1px dashed var(--line);
+        font-size: 11px; color: var(--ink-soft);
+      }
+      .fh-link-btn {
+        background: none; border: none; color: var(--accent);
+        font-size: 12px; font-weight: 600; cursor: pointer; padding: 0;
+        font-family: inherit;
+      }
+      .fh-reset-link { margin-top: 10px; align-self: flex-start; font-size: 11.5px; color: var(--ink-soft); }
+      .fh-tiny-btn {
+        background: var(--paper-alt); border: 1px solid var(--line);
+        color: var(--ink-soft); font-size: 10px; font-family: inherit;
+        border-radius: 10px; padding: 2px 7px; cursor: pointer; flex-shrink: 0;
+      }
+      .fh-shop-tag {
+        background: var(--paper-alt); color: var(--ink-soft);
+        font-size: 10px; padding: 1px 6px; border-radius: 8px; margin-left: 6px;
+      }
+      .fh-trip-meta {
+        display: flex; gap: 10px; padding: 0 16px 12px;
+        font-size: 11px; color: var(--ink-soft);
+      }
+      .fh-hint {
+        font-size: 11.5px; color: var(--ink-soft); line-height: 1.5;
+        margin: 0 0 10px;
+      }
+      .fh-template-btn {
+        border: 2px dashed var(--line); background: none;
+        color: var(--ink-soft); font-family: inherit;
+        font-size: 12.5px; font-weight: 600;
+        padding: 10px; border-radius: 12px; cursor: pointer;
+      }
+
+      .fh-quickstart { text-align: center; }
+      .fh-quickstart-chips { justify-content: center; margin-top: 6px; }
+      .fh-repeat-chip {
+        align-self: center;
+        display: inline-flex; align-items: center; gap: 5px;
+        color: var(--ember);
+      }
+
+      .fh-clear-all-row { display: flex; justify-content: center; }
+      .fh-clear-all-btn {
+        background: none; border: none;
+        color: var(--ink-soft); font-size: 11.5px;
+        cursor: pointer; padding: 4px;
+        display: flex; align-items: center; gap: 4px;
+      }
+      .fh-clear-all-btn:hover { color: var(--red); }
+      .fh-clear-all-confirm {
+        width: 100%;
+        background: #FBEAEA;
+        border: 1px solid #F0C4C4;
+        border-radius: 10px;
+        padding: 10px 12px;
+        display: flex; flex-direction: column; gap: 8px;
+      }
+      .fh-clear-all-confirm span { font-size: 12.5px; color: var(--red); font-weight: 600; }
+      .fh-clear-all-confirm-actions { display: flex; gap: 8px; }
+      .fh-clear-all-confirm-actions button { flex: 1; padding: 7px; font-size: 12.5px; }
+      .fh-btn-danger { background: var(--red); color: #fff; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; }
+
+      .fh-new-trip-btn {
+        border: 2px dashed var(--line);
+        background: none;
+        font-weight: 600; font-size: 13px;
+        padding: 12px; border-radius: 12px;
+        display: flex; align-items: center; justify-content: center; gap: 6px;
+        cursor: pointer;
+      }
+      .fh-new-trip-btn.fh-tone-shop { color: var(--ember); }
+      .fh-new-trip-btn.fh-tone-travel { color: var(--accent); }
+      .fh-new-trip-form { padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+      .fh-new-trip-form input {
+        border: 1px solid var(--line); border-radius: 8px;
+        padding: 9px 10px; font-size: 13px; font-family: inherit;
+      }
+      .fh-date-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-soft); }
+      .fh-date-row input { flex: 1; }
+      .fh-new-trip-actions { display: flex; gap: 8px; margin-top: 4px; }
+      .fh-btn-primary, .fh-btn-secondary {
+        border: none; border-radius: 8px; padding: 9px; font-size: 13px;
+        font-weight: 600; cursor: pointer;
+      }
+      .fh-new-trip-actions .fh-btn-primary, .fh-new-trip-actions .fh-btn-secondary { flex: 1; }
+      .fh-new-trip-actions .fh-btn-primary { background: var(--accent); }
+      .fh-btn-primary { background: var(--vermillion); color: #fff; }
+      .fh-btn-secondary { background: var(--paper-alt); color: var(--ink-soft); }
+
+      @media (prefers-reduced-motion: reduce) {
+        .fh-spinner, .fh-spin { animation: none; }
+      }
+    `}</style>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<FamilyApp />);
+</script>
+</body>
+</html>
